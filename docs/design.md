@@ -52,6 +52,8 @@ The original scaffold fetched the upstream API on every request, with no batchin
 - 36 valid combinations (4 periods × 3 hotels × 3 rooms).
 - A day holds (24 × 60) / 5 = **288 five-minute windows**.
 
+**Observed upstream behavior (verified locally):** intermittent failures arrive in two forms, HTTP 500 and HTTP 200 carrying a `{"status":"error"}` envelope, together on about 14% of calls (28 of 200 sampled); the rate limit returns HTTP 429, a missing or invalid token returns HTTP 401, and the `rate` field is a JSON number. The API documents no error contract, so all of this was confirmed by running the image. Notably a 200 does not imply success, which is why the client checks the envelope and the validator checks the payload.
+
 **Critical math (why batching is required, not optional):**
 - Without batching (one upstream call per combination per cache miss): worst case 36 × 288 = **10,368 calls/day**, far over budget.
 - With batching (one upstream call refreshes all 36 combinations per window): worst case **288 calls/day**, comfortably under 1,000.
@@ -213,7 +215,7 @@ pricing:rates:v1  →  { rates: { "<period>|<hotel>|<room>" => "<rate>", ... 36 
 | `WAITER_CAP` | 8s | Exceeds the ~5s upstream worst case so a waiter catches the winner's write, then degrades before the lock expires. |
 | `LOCK_TTL` | 10s | Exceeds both the upstream call and the waiter cap so the winner finishes before the lock self-releases. |
 
-**No automatic retries.** A failed/timed-out call is not retried inline. The next request and the stale-fallback path absorb transients, which avoids double-spending budget on a call that may already have been metered upstream.
+**No inline retries; the system retries at request cadence.** The upstream fails intermittently on ~14% of calls (measured locally): HTTP 500 and, about as often, HTTP 200 with a `{"status":"error"}` envelope. So transient failure is expected. A failed refresh is not retried within the request: under single-flight and ~10,000 requests/day, the winner degrades and releases the lock, and the next request re-attempts within seconds, so retries cost no added per-request latency while stale-fallback (rate at most ~5 minutes old) covers the gap. Timeouts are never retried: it would double tail latency for the whole waiter cohort, and a timed-out call may already be metered upstream, risking double-counting the real 1,000/day quota. A calibrated single retry on transient failures (5xx, connection, and the 200 error-envelope; not timeouts) was considered (turns those ~14% of failed refreshes from stale to fresh, ~8ms, idempotent) but left out for simplicity; see [Future Work](#future-work).
 
 #### Budget metering
 
@@ -390,6 +392,7 @@ Named edge-case tests:
 ## Future Work
 
 - **Refresh-ahead:** after serving a still-valid entry, pre-fetch the next rate before expiry (e.g. a one-off background job). Optional, and crucially no SPOF, because the request-path refresher (Option 3) remains the source of truth, so the background path is pure latency optimization layered on a correct base.
+- **Calibrated inline retry:** a single retry on transient failures (5xx, connection, and the 200 `{"status":"error"}` envelope; not timeouts) would turn the measured ~14% of refreshes that degrade to stale into fresh responses, at ~8ms and negligible budget. Deferred for simplicity; revisit if transient-flakiness freshness becomes a concern.
 
 ## Open Questions
 
