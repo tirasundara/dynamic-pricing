@@ -1,7 +1,7 @@
 # Dynamic Pricing Proxy - Technical Design Document
 
-**Author:** Tira Sundara (sundaralinus@gmail.com)
-**Date:** 2026-06-13
+**Author:** Tira Sundara (sundaralinus@gmail.com)  
+**Date:** 2026-06-13  
 **Status:** Proposed
 
 ## Problem Statement
@@ -62,27 +62,28 @@ Conclusion: batching is a **requirement**. The pricing API's batch endpoint acce
 
 ### Option 1: Always fetch on demand, no caching, no batching
 
-**Pros:** Simple.
-**Cons:** ~10,000 upstream calls/day (over budget by 10×); upstream latency on every request.
+**Pros:** Simple.  
+**Cons:** ~10,000 upstream calls/day (over budget by 10×); upstream latency on every request.  
 **Verdict:** Reject.
 
 ### Option 2: Fetch on demand with caching + batching, no single-flight locking
 
 Cache duration 5 minutes.
-**Pros:** Drastically fewer upstream calls (~288/day if no stampede); no new components beyond a cache.
-**Cons:** Cache stampede risk: concurrent requests on a cold/expired key each trigger a refresh, multiplying upstream calls under load.
+
+**Pros:** Drastically fewer upstream calls (~288/day if no stampede); no new components beyond a cache.  
+**Cons:** Cache stampede risk: concurrent requests on a cold/expired key each trigger a refresh, multiplying upstream calls under load.  
 **Verdict:** Reject, but a good starting point.
 
 ### Option 3: Fetch on demand with caching + batching + single-flight locking (CHOSEN)
 
-**Pros:** ~288 upstream calls/day worst case; single-flight collapses concurrent refreshes to one upstream call per window; no background infrastructure.
-**Cons:** Added latency on cold start / cache miss; lock adds some complexity. The complexity is justified: it trades a little code for budget safety, and Redis (already needed as the shared cache) provides the lock primitive, so no new dependency.
+**Pros:** ~288 upstream calls/day worst case; single-flight collapses concurrent refreshes to one upstream call per window; no background infrastructure.  
+**Cons:** Added latency on cold start / cache miss; lock adds some complexity. The complexity is justified: it trades a little code for budget safety, and Redis (already needed as the shared cache) provides the lock primitive, so no new dependency.  
 **Verdict:** Accept. Best balance of simplicity and budget safety.
 
 ### Option 4: Scheduled background cache refresh
 
-**Pros:** Cache stays warm; no refresh latency on the request path; ~360 calls/day at a 4-minute cadence; no stampede.
-**Cons:** A background worker is a new moving part with its own monitoring, and is itself a single point of failure (SPOF). If it dies, the cache silently goes stale. It still needs a request-path fallback (i.e. Option 3) for cold start and worker failure, so it's strictly additive complexity over Option 3.
+**Pros:** Cache stays warm; no refresh latency on the request path; ~360 calls/day at a 4-minute cadence; no stampede.  
+**Cons:** A background worker is a new moving part with its own monitoring, and is itself a single point of failure (SPOF). If it dies, the cache silently goes stale. It still needs a request-path fallback (i.e. Option 3) for cold start and worker failure, so it's strictly additive complexity over Option 3.  
 **Verdict:** Reject for now. Captured as [Future Work](#future-work) (refresh-ahead) layered on top of Option 3, where it carries no SPOF risk.
 
 ## Proposed Solution
