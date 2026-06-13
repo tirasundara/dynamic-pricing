@@ -204,14 +204,14 @@ pricing:rates:v1  →  { rates: { "<period>|<hotel>|<room>" => "<rate>", ... 36 
 3. **Waiters** (lock not acquired) poll the cache key every ~100ms for a newer `fetched_at`, capped at `WAITER_CAP`. On a fresh value → serve it. On timeout → re-check the cache once, then degrade exactly like an upstream failure.
 4. Lock self-releases via its TTL, so a crashed winner cannot wedge the key.
 
-**Timeout invariant:** `upstream timeout < LOCK_TTL ≤ WAITER_CAP`. Defaults (all ENV-configurable):
+**Timeout invariant:** `open_timeout + read_timeout < WAITER_CAP < LOCK_TTL`. The upstream call is hard-capped at `open + read` (2 + 3 = 5s). Both `WAITER_CAP` and `LOCK_TTL` must exceed that: `LOCK_TTL` so the winner finishes inside the lock, `WAITER_CAP` so a waiter polls long enough to catch the winner's write. By ~5s the winner's attempt is settled (wrote on success, or failed), so a waiter degrades at `WAITER_CAP` just after the attempt window and before the lock's hard expiry, hence `WAITER_CAP < LOCK_TTL`. Defaults (all ENV-configurable):
 
 | Setting | Default | Rationale |
 | --- | --- | --- |
 | `open_timeout` | 2s | Fail fast on connect. |
-| `read_timeout` | 3s | Bounds the in-lock upstream wait. |
-| `LOCK_TTL` | 10s | Exceeds the worst-case upstream call so the winner finishes before the lock expires. |
-| `WAITER_CAP` | 8s | Waiter gives up before its own request times out, then degrades. |
+| `read_timeout` | 3s | Bounds the in-lock upstream wait (so the call is capped at ~5s). |
+| `WAITER_CAP` | 8s | Exceeds the ~5s upstream worst case so a waiter catches the winner's write, then degrades before the lock expires. |
+| `LOCK_TTL` | 10s | Exceeds both the upstream call and the waiter cap so the winner finishes before the lock self-releases. |
 
 **No automatic retries.** A failed/timed-out call is not retried inline. The next request and the stale-fallback path absorb transients, which avoids double-spending budget on a call that may already have been metered upstream.
 
