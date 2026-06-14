@@ -181,7 +181,7 @@ Every branch ends in exactly one of: fresh 200, stale 200 (with indicator), or d
 - The upstream batch endpoint has no documented limit on `attributes` size; 36 items in one call is assumed acceptable.
 - Redis is a required dependency for the budget cap and lock. If it is unavailable the service fails toward safety (no upstream calls) rather than risk exceeding the cap.
 - The budget counter resets at **midnight UTC**. The upstream's actual reset timezone is unconfirmed (see [Open Questions](#open-questions)); a conservative gate threshold absorbs the uncertainty.
-- Rates are treated as **opaque strings** exactly as the upstream returns them (e.g. `"12000"`). The proxy preserves fidelity and does not parse, cast, or reformat them; that would bake in a money-format assumption the proxy doesn't need.
+- The upstream returns `rate` as a JSON **number** (e.g. `27600`), although its own doc shows a string (`"12000"`). The proxy **normalizes `rate` to a digit string** in its stored and served representation: one stable, exact, client-facing type that we control, rather than leaking the upstream's inconsistent typing or a float-lossy JSON number (the convention pricing/payment APIs use for money). `BatchValidator` accepts either form from the upstream and validates a non-negative integer.
 
 ### Critical Implementation Details
 
@@ -228,7 +228,7 @@ pricing:rates:v1  →  { rates: { "<period>|<hotel>|<room>" => "<rate>", ... 36 
 A 200 with a parseable body is **not** trusted blindly. The batch is accepted only if **all** hold:
 - the body parses and `rates` is an array;
 - building a `{ [period, hotel, room] => rate }` map yields **exactly the 36 requested combinations** (missing → reject; this also makes duplicates and unexpected extras detectable);
-- every rate matches `/\A\d+\z/` (non-empty digit string, which rejects `null`, `""`, `"abc"`, and negatives).
+- every rate is a **non-negative integer**, accepted as a JSON number or a digit string and normalized to a digit string (rejects `null`, `""`, `"abc"`, negatives, and non-integers).
 
 On any failure: reject the **entire** batch, **keep the existing cache entry untouched**, log `upstream_failure` with a reason (e.g. `invalid_batch: missing 2 combos`), and let the degradation path serve the request, identical handling to an upstream 5xx. Combined with pre-increment, a rejected batch still costs one budget unit, which is correct: the upstream did the work.
 
