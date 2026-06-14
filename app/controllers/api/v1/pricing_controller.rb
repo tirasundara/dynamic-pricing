@@ -5,7 +5,8 @@ class Api::V1::PricingController < ApplicationController
     service = Api::V1::PricingService.new(
       period: params[:period],
       hotel: params[:hotel],
-      room: params[:room]
+      room: params[:room],
+      request_id: request.request_id
     )
     service.run
 
@@ -27,19 +28,31 @@ class Api::V1::PricingController < ApplicationController
 
   def validate_params
     if params[:period].blank? || params[:hotel].blank? || params[:room].blank?
-      return render json: { error: "Missing required parameters: period, hotel, room" }, status: :bad_request
+      return invalid_input(:missing_params, "Missing required parameters: period, hotel, room")
     end
 
     unless Combos::PERIODS.include?(params[:period])
-      return render json: { error: "Invalid period. Must be one of: #{Combos::PERIODS.join(', ')}" }, status: :bad_request
+      return invalid_input(:invalid_period, "Invalid period. Must be one of: #{Combos::PERIODS.join(', ')}")
     end
 
     unless Combos::HOTELS.include?(params[:hotel])
-      return render json: { error: "Invalid hotel. Must be one of: #{Combos::HOTELS.join(', ')}" }, status: :bad_request
+      return invalid_input(:invalid_hotel, "Invalid hotel. Must be one of: #{Combos::HOTELS.join(', ')}")
     end
 
     unless Combos::ROOMS.include?(params[:room])
-      return render json: { error: "Invalid room. Must be one of: #{Combos::ROOMS.join(', ')}" }, status: :bad_request
+      return invalid_input(:invalid_room, "Invalid room. Must be one of: #{Combos::ROOMS.join(', ')}")
     end
+  end
+
+  def invalid_input(reason, message)
+    ActiveSupport::Notifications.instrument(
+      "invalid_input.pricing",
+      request_id: request.request_id,
+      reason: reason,
+      period: params[:period],
+      hotel: params[:hotel],
+      room: params[:room]
+    )
+    render json: { error: message }, status: :bad_request
   end
 end

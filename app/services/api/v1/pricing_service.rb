@@ -1,12 +1,15 @@
 module Api::V1
   # Orchestrates a single rate lookup. Sets `result` (an Outcome) for a servable
   # 200 response, or pushes a reason to `errors` for a 503. Collaborators are
-  # injected with sensible defaults for testability.
+  # injected with sensible defaults for testability. Emits *.pricing notifications
+  # at each decision point; the subscriber turns them into structured logs.
   class PricingService < BaseService
-    def initialize(period:, hotel:, room:, cache: RateCache.new, client: RateApiClient, budget: BudgetGate.new)
+    def initialize(period:, hotel:, room:, request_id: nil,
+                   cache: RateCache.new, client: RateApiClient, budget: BudgetGate.new)
       @period = period
       @hotel = hotel
       @room = room
+      @request_id = request_id
       @cache = cache
       @client = client
       @budget = budget
@@ -18,13 +21,18 @@ module Api::V1
     #   Redis down -> serve the in-process L1 snapshot, never calling upstream
     def run
       entry = @cache.read
-      return hit(entry) if entry&.fresh?
+      if entry&.fresh?
+        instrument("cache_hit")
+        return hit(entry)
+      end
 
+      instrument("cache_missed")
       refreshed = @cache.with_refresh_lock { refresh }
       return serve(refreshed, :miss) if refreshed
 
       degrade
     rescue RedisBacked::UnavailableError
+      instrument("redis_unavailable")
       serve_snapshot
     end
 
@@ -34,14 +42,22 @@ module Api::V1
     # Returns the fresh CacheEntry, or nil if it could not refresh (budget gated,
     # upstream failure, or an invalid batch) so the caller degrades.
     def refresh
-      return nil unless @budget.reserve
+      unless @budget.reserve
+        instrument("budget_gate_hit", calls_today: @budget.count)
+        return nil
+      end
+      instrument("budget_warning", calls_today: @budget.count) if @budget.warn?
 
-      body = @client.fetch_all!(attributes: Combos.all)
+      body = instrument("upstream_call") { @client.fetch_all!(attributes: Combos.all) }
       result = BatchValidator.call(body, expected: Combos.all)
-      return nil unless result.valid?
+      unless result.valid?
+        instrument("upstream_failure", type: result.reason)
+        return nil
+      end
 
       @cache.write(result.rates)
-    rescue RateApiClient::UpstreamError
+    rescue RateApiClient::UpstreamError => e
+      instrument("upstream_failure", type: e.kind, status: e.status)
       nil
     end
 
@@ -71,6 +87,7 @@ module Api::V1
       rate = entry.rates[key]
       return unavailable! if rate.nil?
 
+      instrument("stale_served") if cache_status == :stale
       @result = Outcome.new(rate: rate, fetched_at: entry.fetched_at, cache_status: cache_status)
     end
 
@@ -81,6 +98,18 @@ module Api::V1
 
     def key
       @key ||= Combos.key(@period, @hotel, @room)
+    end
+
+    def instrument(event, **payload, &block)
+      ActiveSupport::Notifications.instrument(
+        "#{event}.pricing",
+        request_id: @request_id,
+        period: @period,
+        hotel: @hotel,
+        room: @room,
+        **payload,
+        &block
+      )
     end
   end
 end
