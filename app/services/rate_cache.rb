@@ -1,11 +1,11 @@
 require "securerandom"
 
 # Owns the Redis rate keyspace and coordinates its refresh: read/write the batch,
-# the process-global L1 snapshot, and the single-flight lock. Translates Redis
-# connection errors into RateCache::UnavailableError so the service can fall back to
-# the snapshot and never call upstream without Redis.
+# the process-global L1 snapshot, and the single-flight lock. Redis connection
+# errors surface as RedisBacked::UnavailableError (via the shared with_redis), so
+# the service can fall back to the snapshot and never call upstream without Redis.
 class RateCache
-  class UnavailableError < StandardError; end
+  include RedisBacked
 
   RATES_KEY = "pricing:rates:v1".freeze
   LOCK_KEY  = "pricing:rates:lock".freeze
@@ -93,7 +93,7 @@ class RateCache
     with_redis do
       Rails.cache.delete(LOCK_KEY) if Rails.cache.read(LOCK_KEY) == token
     end
-  rescue UnavailableError
+  rescue RedisBacked::UnavailableError
     nil
   end
 
@@ -106,12 +106,6 @@ class RateCache
 
       sleep(PricingConfig.waiter_poll_interval)
     end
-  end
-
-  def with_redis
-    yield
-  rescue Redis::BaseConnectionError => e
-    raise UnavailableError, e.message
   end
 
   def monotonic

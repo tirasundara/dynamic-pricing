@@ -53,7 +53,7 @@ RSpec.describe RateCache do
       cache.write(rates) # populates the snapshot
       allow(Rails.cache).to receive(:read).and_raise(Redis::BaseConnectionError)
 
-      expect { cache.read }.to raise_error(described_class::UnavailableError)
+      expect { cache.read }.to raise_error(RedisBacked::UnavailableError)
       expect(cache.snapshot&.rates).to eq(rates) # snapshot read never touches Redis
     end
   end
@@ -61,12 +61,12 @@ RSpec.describe RateCache do
   describe 'Redis unavailable' do
     it 'raises UnavailableError when a read hits a connection error' do
       allow(Rails.cache).to receive(:read).and_raise(Redis::BaseConnectionError)
-      expect { cache.read }.to raise_error(described_class::UnavailableError)
+      expect { cache.read }.to raise_error(RedisBacked::UnavailableError)
     end
 
     it 'raises UnavailableError when a write hits a connection error' do
       allow(Rails.cache).to receive(:write).and_raise(Redis::BaseConnectionError)
-      expect { cache.write(rates) }.to raise_error(described_class::UnavailableError)
+      expect { cache.write(rates) }.to raise_error(RedisBacked::UnavailableError)
     end
   end
 
