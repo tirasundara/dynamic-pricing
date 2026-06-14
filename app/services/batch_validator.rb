@@ -29,7 +29,7 @@ module BatchValidator
     parsed["rates"].each do |row|
       return Result.invalid("malformed_row") unless row.is_a?(Hash)
 
-      key = combo_key(row["period"], row["hotel"], row["room"])
+      key = Combos.key(row["period"], row["hotel"], row["room"])
       return Result.invalid("duplicate_combo:#{key}") if rates.key?(key)
 
       rate = normalize_rate(row["rate"])
@@ -38,7 +38,7 @@ module BatchValidator
       rates[key] = rate
     end
 
-    expected_keys = expected.map { |c| combo_key(c[:period], c[:hotel], c[:room]) }
+    expected_keys = expected.map { |c| Combos.key(c[:period], c[:hotel], c[:room]) }
     missing = expected_keys - rates.keys
     extra = rates.keys - expected_keys
     return Result.invalid("missing_combos:#{missing.size}") if missing.any?
@@ -54,8 +54,6 @@ module BatchValidator
   rescue JSON::ParserError, TypeError
     nil
   end
-
-  def combo_key(period, hotel, room) = "#{period}|#{hotel}|#{room}"
 
   # JSON number or digit string -> digit string for a non-negative integer;
   # nil (invalid) for null, negative, float, or non-numeric values.
