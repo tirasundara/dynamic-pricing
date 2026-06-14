@@ -55,7 +55,13 @@ Rails.application.configure do
   config.log_level = ENV.fetch("RAILS_LOG_LEVEL", "info")
 
   # Use Redis as the shared cache/lock/budget store in production.
-  config.cache_store = :redis_cache_store, { url: ENV.fetch("REDIS_URL", "redis://localhost:6379/0") }
+  config.cache_store = :redis_cache_store, {
+    url: ENV.fetch("REDIS_URL", "redis://localhost:6379/0"),
+    # Re-raise Redis connection errors so RateCache can detect a Redis outage and
+    # fall back to the L1 snapshot, instead of the default swallow-return-nil that
+    # would look like a cache miss and trigger an upstream call without Redis.
+    error_handler: ->(method:, returning:, exception:) { raise exception }
+  }
 
   # Use a real queuing backend for Active Job (and separate queues per environment).
   # config.active_job.queue_adapter = :resque

@@ -20,7 +20,14 @@ Rails.application.configure do
   # The pricing proxy depends on the cache (rates, single-flight lock, budget
   # counter), so Redis-backed caching is always on in development, independent
   # of the `rails dev:cache` toggle, which only governs view/action caching.
-  config.cache_store = :redis_cache_store, { url: ENV.fetch("REDIS_URL", "redis://localhost:6379/0") }
+  config.cache_store = :redis_cache_store, {
+    url: ENV.fetch("REDIS_URL", "redis://localhost:6379/0"),
+    # Re-raise Redis connection errors (after redis-client's own reconnect
+    # attempts) instead of the default swallow-and-return-nil, so RateCache can
+    # detect a Redis outage and fall back to the L1 snapshot rather than treating
+    # it as a cache miss and wrongly calling upstream without Redis.
+    error_handler: ->(method:, returning:, exception:) { raise exception }
+  }
 
   # Run rails dev:cache to toggle view/action caching.
   if Rails.root.join("tmp/caching-dev.txt").exist?
