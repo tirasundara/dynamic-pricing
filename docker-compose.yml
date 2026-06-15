@@ -18,6 +18,22 @@ services:
     environment:
       - RATE_API_URL=http://rate-api:8080
       - REDIS_URL=redis://redis:6379/0
+      # Host-env passthrough (empty -> code default) so the integration tests can
+      # shrink the freshness window and observe the stale/degradation paths without
+      # waiting 5 minutes; see script/integration/run.sh.
+      - PRICING_FRESH_WINDOW_SECONDS=${PRICING_FRESH_WINDOW_SECONDS:-}
+      #
+      # Every proxy tunable can be set here. Defaults shown below; uncomment to change.
+      # - RATE_API_TOKEN=04aa6f42aa03f220c2ae9a276cd68c62  # upstream auth token
+      # - PRICING_MAX_STALE_SECONDS=3600                   # how long stale is servable; also the cache TTL
+      # - PRICING_LOCK_TTL_SECONDS=10                      # single-flight lock lifetime
+      # - PRICING_WAITER_CAP_SECONDS=8                     # how long a waiter polls before degrading
+      # - PRICING_WAITER_POLL_INTERVAL_SECONDS=0.1         # waiter poll cadence
+      # - PRICING_OPEN_TIMEOUT_SECONDS=2                   # upstream connect timeout
+      # - PRICING_READ_TIMEOUT_SECONDS=3                   # upstream read timeout
+      # - PRICING_DAILY_QUOTA=1000                         # upstream daily cap (drives calls_remaining)
+      # - PRICING_BUDGET_WARN=800                          # warn threshold on the daily counter
+      # - PRICING_BUDGET_LIMIT=950                         # hard gate: skip upstream and degrade past this
     depends_on:
       - rate-api
       - redis
