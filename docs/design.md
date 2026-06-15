@@ -1,8 +1,8 @@
-# Dynamic Pricing Proxy - Technical Design Document
+# Technical Design Document: Dynamic Pricing Proxy
 
 **Author:** Tira Sundara (sundaralinus@gmail.com)  
 **Date:** 2026-06-13  
-**Status:** Proposed
+**Status:** Implemented
 
 ## Problem Statement
 
@@ -92,7 +92,7 @@ Cache duration 5 minutes.
 
 ### Architecture
 
-High-level topology. One Redis backs the cache, the single-flight lock, and the daily budget counter, which is what keeps the budget cap correct across multiple proxy replicas. The proxy calls the upstream only on a miss or stale entry, so client load (≥10,000/day) is decoupled from upstream load (≤288/day, well under the 1,000/day cap).
+One Redis backs the cache, the single-flight lock, and the daily budget counter, which keeps the budget cap correct across multiple proxy replicas. The proxy calls the upstream only on a miss or stale entry, so client load (≥10,000/day) is decoupled from upstream load (≤288/day, well under the 1,000/day cap).
 
 ```mermaid
 flowchart LR
@@ -157,9 +157,13 @@ Every branch ends in exactly one of: fresh 200, stale 200 (with indicator), or d
 | --- | --- |
 | `Api::V1::PricingController` | Validate params (existing logic), call the service, render the uniform response body + cache headers. |
 | `Api::V1::PricingService` | Orchestrate: classify cache age, run single-flight refresh or wait, apply budget gate, choose fresh/stale/error outcome. |
-| `RateCache` (store wrapper) | Read/write the single batch entry in Redis; maintain the per-process **L1 snapshot** (in-process last-known-good copy, defined under [Critical Implementation Details](#redis-unavailable-l1-snapshot-degradation)); expose the age classifier (`fresh` / `stale` / `expired`). |
-| `BudgetGate` | Pre-increment and check the date-keyed daily counter in Redis. |
-| `RateApiClient` | Batch POST of all 36 attributes with explicit timeouts (extends the existing HTTParty client). |
+| `RateCache` (store wrapper) | Read/write the single batch entry in Redis (returning a `CacheEntry`); coordinate the single-flight lock; maintain the per-process **L1 snapshot** (in-process last-known-good copy, defined under [Critical Implementation Details](#redis-unavailable-l1-snapshot-degradation)). |
+| `BudgetGate` | Check then increment the date-keyed daily counter in Redis, gating at the limit. |
+| `RateApiClient` | Batch POST of all 36 attributes with explicit timeouts (extends the existing HTTParty client). Raises a typed `UpstreamError` on failure, including a 200 carrying a `{"status":"error"}` envelope. |
+| `BatchValidator` | All-or-nothing validation of the upstream batch: parse it, require exactly the 36 requested combinations, validate each rate as a non-negative integer, and normalize it to a digit string. |
+| `CacheEntry`, `Outcome` | Immutable `Data` value objects. `CacheEntry` holds the cached batch and classifies itself by age (`fresh` / `stale` / `expired`); `Outcome` is what the service returns for a 200. |
+| `Combos` | The 36-combo attribute space and the shared `period\|hotel\|room` cache key. |
+| `PricingConfig` | Every tunable, read from ENV with defaults. |
 | Notifications subscriber | Translate `ActiveSupport::Notifications` events into single-line JSON logs and derive metrics. |
 
 ### Key Decisions
@@ -306,7 +310,7 @@ Prometheus/Grafana was considered and **rejected** as over-engineering for this 
 `GET /internal/stats` returns live values for quick inspection / curl during review:
 
 ```json
-{ "calls_today": 142, "calls_remaining": 858, "cache_age_seconds": 37, "cache_status": "fresh" }
+{ "redis": "up", "calls_today": 142, "calls_remaining": 858, "cache_status": "fresh", "cache_age_seconds": 37 }
 ```
 
 ### Metrics
@@ -324,8 +328,7 @@ Each metric is derived from a log event/field rather than a separate instrumenta
 | `pricing.upstream.latency` | Histogram | `duration` on `upstream_call` | Batch call duration (p50/p95/p99) |
 | `pricing.upstream.errors` | Counter | count of `upstream_failure` (by `type`) | Timeouts, 5xx, 429, validation failures |
 | `pricing.requests.latency` | Histogram | `duration` on request-complete event | End-to-end request duration |
-| `pricing.requests.errors` | Counter | count of 4xx/503 responses | Errors returned to clients |
-| `pricing.lock.contention` | Counter | count of `lock_wait` | Requests that waited on single-flight |
+| `pricing.requests.errors` | Counter | count of `invalid_input` (4xx) + 503 responses | Errors returned to clients |
 
 ### Structured logging
 
@@ -333,20 +336,19 @@ JSON logs, one event per line, with request correlation:
 
 ```json
 {
-  "timestamp": "2026-06-09T10:30:00Z",
-  "level": "info",
   "event": "cache_missed",
+  "timestamp": "2026-06-14T10:30:00.012Z",
+  "duration_ms": 0.01,
+  "request_id": "req-123",
   "period": "Summer",
   "hotel": "FloatingPointResort",
-  "room": "SingletonRoom",
-  "upstream_calls_today": 142,
-  "request_id": "req-123"
+  "room": "SingletonRoom"
 }
 ```
 
 (`request_id` alone suffices for a single service; a separate `correlation_id` would only matter once requests fan out across multiple services, which is out of scope.)
 
-Key events: `cache_hit` (debug), `cache_missed` (info), `upstream_call` (info, with duration), `upstream_failure` (error, with type), `stale_served` (warn), `budget_warning` (warn), `budget_gate_hit` (warn), `budget_exceeded` (error), `lock_wait` (debug), `lock_acquired` (debug), `redis_unavailable` (error), `invalid_input` (info).
+Events emitted: `cache_hit` (debug), `cache_missed` (info), `upstream_call` (info, with duration), `upstream_failure` (error, with `type`), `stale_served` (warn), `budget_warning` (warn), `budget_gate_hit` (warn), `redis_unavailable` (error), `invalid_input` (info).
 
 ### Alerts
 
@@ -365,15 +367,15 @@ Key events: `cache_hit` (debug), `cache_missed` (info), `upstream_call` (info, w
 - **Lenient per-combo validation with per-entry `fetched_at` (rejected).** Caching each valid combo individually shrinks the blast radius of a partial upstream failure, but: because every refresh requests all 36 combos in one batch, per-combo timestamps only ever diverge in the rare failure case, so the extra state exists solely to model the exception; it forces a read-modify-write merge under the lock, requires per-combo negative-caching/backoff to stop one persistently-bad combo from triggering refreshes until the budget gate trips (starving the healthy 35), and makes "success" fuzzy for metrics and alerts. All-or-nothing is a dumb `SET` with a crisp success boolean, and the stale-fallback already caps the downside of rejecting a batch. The trade flips only at large, sharded combination spaces, which is out of scope.
 - **Prometheus + Grafana in the default stack (rejected).** Demonstrable dashboards, but adds containers/provisioning to the path reviewers must run, costs hours better spent on tests, and `prometheus-client`'s per-process store is incorrect under multi-worker Puma, the exact topology the design targets. JSON logs satisfy the "logging, metrics, or traces" criterion; the Notifications seam preserves the upgrade path.
 - **Raw `redis-rb` instead of `Rails.cache` (rejected).** More explicit control (Lua, `WATCH`, owner-checked release), but bypasses Rails conventions and needs a real Redis/fake in tests. The atomic operations needed (`SET NX EX`, `INCR`) are all reachable through `Rails.cache`, and the memory-store swap keeps tests simple.
-- **422 instead of 400 for invalid params (rejected; keep 400).** 422 (well-formed but unprocessable) is arguably sharper and matches Rails' validation convention, but the scaffold already established 400 with six passing tests; both codes are defensible for enum validation, so I keep the established contract and note the trade-off rather than churn the API and its tests for purity.
+- **422 instead of 400 for invalid params (rejected; keep 400).** 422 (well-formed but unprocessable) is arguably sharper and matches Rails' validation convention, but the scaffold already established 400 with seven passing tests; both codes are defensible for enum validation, so I keep the established contract and note the trade-off rather than churn the API and its tests for purity.
 
 ## Status codes (400 vs 422)
 
-The scaffold returns **400** for missing or unsupported parameters. I keep 400 (not the 422 an earlier draft of this doc suggested): both are defensible for enum validation, and preserving the established contract avoids rewriting the six passing scaffold tests for no behavioral gain. The README notes this trade-off explicitly.
+The scaffold returns **400** for missing or unsupported parameters. I keep 400 (not the 422 an earlier draft of this doc suggested): both are defensible for enum validation, and preserving the established contract avoids rewriting the seven passing scaffold tests for no behavioral gain. The README notes this trade-off explicitly.
 
 ## Testing Strategy
 
-Framework: **RSpec** (replacing the scaffold's Minitest). Rationale: tests are the most heavily weighted evaluation criterion and must be defensible live; RSpec is the framework I am most fluent in, and the FAQ explicitly permits library swaps. All six scaffold Minitest tests are **ported assertion-for-assertion** into request specs in a dedicated commit (proving the API contract survived the migration) before any behavior changes; Minitest is then removed so the repo has one test runner.
+Framework: **RSpec** (replacing the scaffold's Minitest). Rationale: tests are the most heavily weighted evaluation criterion and must be defensible live; RSpec is the framework I am most fluent in, and the FAQ explicitly permits library swaps. All seven scaffold Minitest tests are **ported assertion-for-assertion** into request specs in a dedicated commit (proving the API contract survived the migration) before any behavior changes; Minitest is then removed so the repo has one test runner.
 
 Test infrastructure:
 - **WebMock** stubs at the HTTP boundary, so the real client path runs (including `to_timeout` for read-timeout behavior and malformed-body handling).
@@ -387,7 +389,7 @@ Named edge-case tests:
 - **Batch rejection keeps cache:** 35/36 combos, `null`/`""`/`"abc"`/negative rate ⇒ old entry retained, request degraded.
 - **Budget gate:** at limit minus 1 the call is allowed, at the limit it is skipped and degrades (default limit 950, set via `PRICING_BUDGET_LIMIT`).
 - **Snapshot path:** store raises a connection error ⇒ stale serve from L1 snapshot, then 503 once past max-stale.
-- **Ported scaffold contract specs:** all six original cases stay green.
+- **Ported scaffold contract specs:** the seven scaffold cases were ported first to prove the contract survived the RSpec migration; the five validation cases remain, while the happy-path and upstream-failure cases were rewritten once batching changed the response shape (uniform body + `Age` / `X-Cache-Status` headers, and a 503 instead of a 400 when upstream fails cold).
 
 ## Future Work
 
